@@ -1,0 +1,9 @@
+# Runtime dependencies for faruvcOptimiser
+numpy>=1.26
+scipy>=1.13
+pulp>=2.8           # ILP solver (bundled CBC) for minimum-lamp optimisation
+fastapi>=0.110
+uvicorn[standard]>=0.29
+
+# Dev / validation only (not required to run the optimiser):
+#   guv_calcs        # oracle to cross-check our field & TLV numbers vs Illuminate

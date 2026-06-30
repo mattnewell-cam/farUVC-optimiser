@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>far-UVC Optimiser — Ushio B1</title>
+<style>
+  :root { --bg:#0f1419; --panel:#1a222c; --line:#2c3a47; --accent:#37c8ff; --txt:#dfe7ee; --muted:#8aa0b2; --ok:#3ad29f; --bad:#ff6b6b; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.45 system-ui,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--txt); }
+  header { padding:12px 18px; border-bottom:1px solid var(--line); display:flex; align-items:baseline; gap:12px; }
+  header h1 { font-size:16px; margin:0; font-weight:600; }
+  header span { color:var(--muted); font-size:12px; }
+  .wrap { display:flex; gap:16px; padding:16px; align-items:flex-start; flex-wrap:wrap; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px; }
+  canvas { background:#0b0f14; border-radius:8px; cursor:crosshair; display:block; }
+  .controls { width:280px; display:flex; flex-direction:column; gap:12px; }
+  label { display:flex; flex-direction:column; gap:4px; font-size:12px; color:var(--muted); }
+  input, select, button { font:inherit; background:#0e151c; color:var(--txt); border:1px solid var(--line); border-radius:6px; padding:7px 9px; }
+  button { cursor:pointer; background:var(--accent); color:#04222e; border:none; font-weight:600; }
+  button.secondary { background:#243140; color:var(--txt); }
+  button:disabled { opacity:.5; cursor:default; }
+  .row { display:flex; gap:8px; }
+  .row > * { flex:1; }
+  .hint { font-size:12px; color:var(--muted); }
+  .results { width:300px; }
+  .metric { display:flex; justify-content:space-between; padding:4px 0; border-bottom:1px dashed var(--line); }
+  .metric b { font-weight:600; }
+  .pill { padding:2px 8px; border-radius:10px; font-size:11px; font-weight:600; }
+  .pill.ok { background:rgba(58,210,159,.15); color:var(--ok); }
+  .pill.bad { background:rgba(255,107,107,.15); color:var(--bad); }
+  .msg { font-size:12px; color:var(--muted); margin-top:8px; }
+  h3 { font-size:13px; margin:0 0 8px; color:var(--txt); }
+  .legend { height:10px; border-radius:5px; margin-top:6px;
+    background:linear-gradient(90deg,#08306b,#2171b5,#41ab5d,#fdae61,#d7301f); }
+</style>
+</head>
+<body>
+<header>
+  <h1>far-UVC Optimiser</h1>
+  <span>Ushio Care222 B1 · minimum-lamp placement · ACGIH / ICNIRP</span>
+</header>
+
+<div class="wrap">
+  <div class="panel">
+    <canvas id="cv" width="760" height="560"></canvas>
+    <div class="hint" id="hint">Click to place room corners. Click the first corner to close. Drag corners to adjust.</div>
+  </div>
+
+  <div class="controls panel">
+    <h3>Room</h3>
+    <div class="row">
+      <button class="secondary" id="preset">Rectangle 5×4</button>
+      <button class="secondary" id="reset">Clear</button>
+    </div>
+    <label>Ceiling height (m)
+      <input id="height" type="number" value="3.0" step="0.1" min="2.0" max="6"/>
+    </label>
+
+    <h3>Targets</h3>
+    <label>Target average fluence (µW/cm²)
+      <input id="target" type="number" value="1.0" step="0.1" min="0.05"/>
+    </label>
+    <label>Regulation
+      <select id="standard">
+        <option value="rp27_1">RP 27.1-22 (ACGIH)</option>
+        <option value="ul8802">UL 8802 (ACGIH)</option>
+        <option value="icnirp">IEC 62471-6:2022 (ICNIRP)</option>
+      </select>
+    </label>
+    <label>Lamp placement
+      <select id="mode">
+        <option value="downlight">Downlights only (ceiling)</option>
+        <option value="corner_edge">Allow corner / edge lamps</option>
+      </select>
+    </label>
+    <label>Assessment plane height (m)
+      <input id="occ" type="number" value="1.8" step="0.1" min="0.5" max="2.5"/>
+    </label>
+
+    <button id="run">Optimise</button>
+    <div class="hint" id="status"></div>
+  </div>
+
+  <div class="results panel">
+    <h3>Result</h3>
+    <div id="summary" class="hint">Draw a room and click Optimise.</div>
+    <div id="metrics"></div>
+    <div class="legend" id="legend" style="display:none"></div>
+    <div class="hint" id="legendLabel" style="display:none"></div>
+    <div class="msg" id="message"></div>
+  </div>
+</div>
+
+<script>
+const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+const SCALE = 50, MARGIN = 40;           // px per metre; world origin offset
+const W2P = (x,y) => [MARGIN + x*SCALE, cv.height - MARGIN - y*SCALE];
+const P2W = (px,py) => [(px-MARGIN)/SCALE, (cv.height-MARGIN-py)/SCALE];
+
+let pts = [], closed = false, drag = -1, lastResult = null;
+
+function dist(ax,ay,bx,by){ return Math.hypot(ax-bx, ay-by); }
+
+cv.addEventListener('mousedown', e => {
+  const [mx,my] = mouse(e);
+  if (closed) {                                   // start dragging a vertex
+    for (let i=0;i<pts.length;i++){ const [px,py]=W2P(...pts[i]); if (dist(mx,my,px,py)<10){ drag=i; return; } }
+    return;
+  }
+  if (pts.length>=3){ const [fx,fy]=W2P(...pts[0]); if (dist(mx,my,fx,fy)<12){ closed=true; draw(); return; } }
+  pts.push(P2W(mx,my)); draw();
+});
+cv.addEventListener('mousemove', e => {
+  const [mx,my]=mouse(e);
+  if (drag>=0){ pts[drag]=P2W(mx,my); lastResult=null; draw(); }
+  else if (!closed && pts.length){ draw(); const [lx,ly]=W2P(...pts[pts.length-1]); ctx.strokeStyle='#3a4a59'; ctx.beginPath(); ctx.moveTo(lx,ly); ctx.lineTo(mx,my); ctx.stroke(); }
+});
+window.addEventListener('mouseup', ()=> drag=-1);
+function mouse(e){ const r=cv.getBoundingClientRect(); return [e.clientX-r.left, e.clientY-r.top]; }
+
+// Each standard has a nominal assessment-plane height (UL 8802 uses 1.9 m).
+document.getElementById('standard').onchange = (e)=>{
+  document.getElementById('occ').value = e.target.value==='ul8802' ? '1.9' : '1.8';
+};
+document.getElementById('preset').onclick = ()=>{ pts=[[0,0],[5,0],[5,4],[0,4]]; closed=true; lastResult=null; draw(); };
+document.getElementById('reset').onclick = ()=>{ pts=[]; closed=false; lastResult=null; draw(); document.getElementById('summary').textContent='Draw a room and click Optimise.'; document.getElementById('metrics').innerHTML=''; document.getElementById('message').textContent=''; document.getElementById('legend').style.display='none'; document.getElementById('legendLabel').style.display='none'; };
+
+function colormap(t){ // 0..1 -> rgb, blue->cyan->green->yellow->red
+  t=Math.max(0,Math.min(1,t));
+  const stops=[[8,48,107],[33,113,181],[65,171,93],[253,174,97],[215,48,31]];
+  const f=t*(stops.length-1), i=Math.floor(f), g=f-i;
+  if(i>=stops.length-1) return stops[stops.length-1];
+  const a=stops[i], b=stops[i+1];
+  return [a[0]+(b[0]-a[0])*g, a[1]+(b[1]-a[1])*g, a[2]+(b[2]-a[2])*g];
+}
+
+function drawGrid(){
+  ctx.strokeStyle='#161f29'; ctx.lineWidth=1;
+  for(let x=0; x*SCALE+MARGIN<cv.width; x++){ const [px]=W2P(x,0); ctx.beginPath(); ctx.moveTo(px,0); ctx.lineTo(px,cv.height); ctx.stroke(); }
+  for(let y=0; cv.height-MARGIN-y*SCALE>0; y++){ const [,py]=W2P(0,y); ctx.beginPath(); ctx.moveTo(0,py); ctx.lineTo(cv.width,py); ctx.stroke(); }
+}
+
+function drawHeatmap(){
+  if(!lastResult || !lastResult.heatmap) return;
+  const hm=lastResult.heatmap, vals=hm.values, [xmn,xmx,ymn,ymx]=hm.extent;
+  const ny=vals.length, nx=vals[0].length, vmax=hm.vmax||1;
+  const dx=(xmx-xmn)/(nx-1), dy=(ymx-ymn)/(ny-1);
+  for(let j=0;j<ny;j++) for(let i=0;i<nx;i++){
+    const v=vals[j][i]; if(v===null) continue;
+    const [px,py]=W2P(xmn+i*dx, ymn+j*dy);
+    const c=colormap(v/vmax);
+    ctx.fillStyle=`rgba(${c[0]|0},${c[1]|0},${c[2]|0},0.85)`;
+    ctx.fillRect(px-dx*SCALE/2-1, py-dy*SCALE/2-1, dx*SCALE+2, dy*SCALE+2);
+  }
+}
+
+function draw(){
+  ctx.clearRect(0,0,cv.width,cv.height);
+  drawGrid();
+  drawHeatmap();
+  // polygon
+  if(pts.length){
+    ctx.strokeStyle='#37c8ff'; ctx.lineWidth=2; ctx.fillStyle='rgba(55,200,255,0.06)';
+    ctx.beginPath(); pts.forEach((p,i)=>{ const [px,py]=W2P(...p); i?ctx.lineTo(px,py):ctx.moveTo(px,py); });
+    if(closed) ctx.closePath(); ctx.stroke(); if(closed) ctx.fill();
+    // edge length labels
+    if(closed){ ctx.fillStyle='#8aa0b2'; ctx.font='11px system-ui';
+      for(let i=0;i<pts.length;i++){ const a=pts[i], b=pts[(i+1)%pts.length];
+        const len=dist(a[0],a[1],b[0],b[1]).toFixed(2); const [mx,my]=W2P((a[0]+b[0])/2,(a[1]+b[1])/2);
+        ctx.fillText(len+' m', mx+4, my-4); } }
+    // vertices
+    pts.forEach(p=>{ const [px,py]=W2P(...p); ctx.fillStyle='#fff'; ctx.beginPath(); ctx.arc(px,py,4,0,7); ctx.fill(); });
+  }
+  // lamps
+  if(lastResult && lastResult.lamps){ lastResult.lamps.forEach(L=>{ const [px,py]=W2P(L.x,L.y);
+    ctx.fillStyle='#ffd54a'; ctx.strokeStyle='#000'; ctx.lineWidth=1;
+    if(L.kind==='downlight'){ ctx.beginPath(); ctx.arc(px,py,7,0,7); ctx.fill(); ctx.stroke(); }
+    else { ctx.beginPath(); ctx.moveTo(px,py-8); ctx.lineTo(px+7,py+6); ctx.lineTo(px-7,py+6); ctx.closePath(); ctx.fill(); ctx.stroke(); }
+  }); }
+}
+
+document.getElementById('run').onclick = async ()=>{
+  if(!closed || pts.length<3){ setStatus('Draw and close a room first.'); return; }
+  const body = {
+    vertices: pts, height:+height.value, target_fluence:+target.value,
+    standard:standard.value, mode:mode.value, occupant_height:+occ.value,
+  };
+  setStatus('Optimising…'); document.getElementById('run').disabled=true;
+  try{
+    const res = await fetch('/optimize',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    lastResult = await res.json(); render(); setStatus('');
+  }catch(err){ setStatus('Error: '+err); }
+  document.getElementById('run').disabled=false;
+};
+function setStatus(s){ document.getElementById('status').textContent=s; }
+
+function render(){
+  draw();
+  const r=lastResult, m=r.metrics||{}, sum=document.getElementById('summary'), met=document.getElementById('metrics');
+  if(r.status!=='optimal'){
+    sum.innerHTML = `<span class="pill bad">${r.status}</span>`;
+    met.innerHTML=''; document.getElementById('legend').style.display='none'; document.getElementById('legendLabel').style.display='none';
+    document.getElementById('message').textContent = r.message||''; return;
+  }
+  sum.innerHTML = `<b style="font-size:22px">${r.n_lamps}</b> B1 lamp${r.n_lamps===1?'':'s'} &nbsp;<span class="pill ok">compliant</span><br><span class="hint">${r.standard_label}</span>`;
+  const skinOk = m.max_skin<=m.skin_cap, eyeOk = m.max_eye<=m.eye_cap;
+  met.innerHTML = `
+    <div class="metric"><span>Avg fluence</span><b>${m.avg_fluence.toFixed(2)} / ${m.target_fluence.toFixed(2)} µW/cm²</b></div>
+    <div class="metric"><span>Min fluence (covered)</span><b>${m.min_fluence.toFixed(2)} µW/cm²</b></div>
+    <div class="metric"><span>Max skin</span><b>${m.max_skin.toFixed(2)} / ${m.skin_cap.toFixed(2)} <span class="pill ${skinOk?'ok':'bad'}">${skinOk?'ok':'over'}</span></b></div>
+    <div class="metric"><span>Max eye</span><b>${m.max_eye.toFixed(2)} / ${m.eye_cap.toFixed(2)} <span class="pill ${eyeOk?'ok':'bad'}">${eyeOk?'ok':'over'}</span></b></div>`;
+  if(r.heatmap){ document.getElementById('legend').style.display='block';
+    const ll=document.getElementById('legendLabel'); ll.style.display='block';
+    const pk = r.heatmap.peak ? `, peak ${r.heatmap.peak.toFixed(1)}` : '';
+    ll.textContent=`Fluence coverage (column-avg): 0 → ${r.heatmap.vmax.toFixed(2)} µW/cm² (95th pct${pk})`; }
+  document.getElementById('message').textContent = r.message||'';
+}
+
+draw();
+</script>
+</body>
+</html>

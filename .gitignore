@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtual environment
+.venv/
+venv/
+
+# IDE / editor
+.idea/
+.vscode/
+
+# Claude Code local tooling & memory (not part of the project)
+.claude/
+
+# OS
+Thumbs.db
+.DS_Store
