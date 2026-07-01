@@ -27,6 +27,7 @@ def generate_candidates(
     ceiling_offset: float = 0.05,
     grid_spacing: float = 0.6,
     wall_inset: float = 0.3,
+    edge_inset: float = 0.1,
     wall_mount_height: float | None = None,
     wall_spacing: float = 1.0,
     wall_tilt_deg: float = 30.0,
@@ -41,6 +42,10 @@ def generate_candidates(
     candidates: list[LampInstance] = []
 
     # --- ceiling downlights ------------------------------------------------
+    # Downlights are inset from the walls (wall_inset): a ceiling fixture can't hang in
+    # the wall, and a downlight against a wall wastes half its cone. Wall/corner MOUNTS,
+    # by contrast, physically sit ON the wall/corner -> only a token edge_inset to keep
+    # them inside the polygon (and off the 1/r^2 singularity).
     for xy in _interior_grid(room, grid_spacing, wall_inset):
         candidates.append(LampInstance(photometry, pos=(xy[0], xy[1], z_ceil), aim=DOWN))
 
@@ -59,7 +64,7 @@ def generate_candidates(
         npts = max(1, int(round(length / wall_spacing)))
         for k in range(npts):
             t = (k + 0.5) / npts
-            base = p0 + t * edge + n_in * wall_inset
+            base = p0 + t * edge + n_in * edge_inset
             aim = _tilt_down(n_in, wall_tilt_deg)
             candidates.append(LampInstance(photometry, pos=(base[0], base[1], h), aim=aim))
 
@@ -74,7 +79,7 @@ def generate_candidates(
         # ensure it points inward
         if not room.contains((cur + bis * 0.1)[None, :])[0]:
             bis = -bis
-        base = cur + bis * (wall_inset * 1.5)
+        base = cur + bis * edge_inset
         aim = _tilt_down(bis, corner_tilt_deg)
         candidates.append(LampInstance(photometry, pos=(base[0], base[1], h), aim=aim))
 

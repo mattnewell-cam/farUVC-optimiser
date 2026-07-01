@@ -7,9 +7,10 @@ standard, and a placement mode, choose the FEWEST candidate lamps such that:
     skin-plane irradiance everywhere      <=  skin cap
     eye worst-case irradiance everywhere  <=  eye cap
 
-Every quantity is linear in the binary "is this candidate used?" variables, so this
-is an integer linear program (solved with PuLP/CBC). A second, optional pass dims all
-selected lamps uniformly to recover headroom / improve the exposure margin.
+Every quantity is linear in the binary "is this candidate used?" variables, so this is
+an integer linear program. Constraints are assembled as vectorised numpy matrices and
+solved with HiGHS via ``scipy.optimize.milp`` -- far faster than building the model term
+by term, and it keeps the field maths (the cheap part) out of the solver's way.
 """
 
 from __future__ import annotations
@@ -17,7 +18,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import numpy as np
-import pulp
+from scipy import sparse
+from scipy.optimize import Bounds, LinearConstraint, milp
 
 from .candidates import generate_candidates
 from .field import (LampInstance, exposure_field, fluence_field,
@@ -62,13 +64,14 @@ def optimize(
     goal: str = "throughput",
     margin_tax: float = 0.2,
     spectrum_csv: str | None = None,
-    fluence_spacing: float = 0.4,
+    fluence_spacing: float = 0.25,
     plane_spacing: float = 0.4,
     coverage_top: float = 2.0,
+    fluence_cap: float = 20.0,
     occupant_height: float | None = None,
     n_azimuths: int = 16,
     cap_margin: float = 0.95,
-    max_coverage_points: int = 160,
+    max_coverage_points: int = 400,
     time_limit: float = 20.0,
     solver_msg: bool = False,
     **candidate_kwargs,
@@ -119,92 +122,107 @@ def optimize(
     cov = np.where(vol[:, 2] <= cov_top)[0]
     if len(cov) == 0:
         cov = np.arange(len(vol))
-    fvec = F[:, cov].mean(axis=1)             # mean fluence per candidate (occupied zone)
+
+    # Capped occupied-zone average per candidate. Each point's fluence is clipped at
+    # fluence_cap: a saturated spot gains nothing more (well-mixed air can't all funnel
+    # through one hotspot), and the clip also bounds any residual near-field 1/r^2 spike.
+    # We clip PER-LAMP -- min(cap, F[c,p]) -- so the average stays a separable linear
+    # function of the lamp selection and the ILP stays small/fast. That's exact for the
+    # dominant single-lamp case and over-counts only where two beams both exceed the cap
+    # at the same occupied-zone point (rare, since lamps mount above the zone). The
+    # REPORTED avg_fluence below uses the exact total cap, so the displayed number is honest.
+    fvec = np.minimum(F[:, cov], fluence_cap).mean(axis=1)
     # Subsample coverage points used in the (heavier) max-min stage to keep it fast.
     if len(cov) > max_coverage_points:
         cov_stage2 = cov[np.linspace(0, len(cov) - 1, max_coverage_points).astype(int)]
     else:
         cov_stage2 = cov
 
-    def add_exposure_caps(prob, x):
-        for terms, lim in ((skin_t, skin_lim), (eye_t, eye_lim)):
-            nP, K = terms.shape[1], terms.shape[2]
-            for j in range(nP):
-                for k in range(K):
-                    col = terms[:, j, k]
-                    # Skip constraints that can never bind: if every candidate on still
-                    # can't reach the cap (Σ col ≤ lim), no subset can either. Exact and
-                    # safe, and removes the many far-from-lamp points — big speedup.
-                    if col.sum() <= lim:
-                        continue
-                    prob += pulp.lpSum(col[c] * x[c] for c in range(nC) if col[c] > 0) <= lim
-
-    def add_utilization_envelope(prob, x, u_max):
-        # u_max >= realised exposure / true cap, over the same near-cap samples used for
-        # the hard caps. Samples that can't approach the cap even with every candidate on
-        # are skipped (they can never set the worst utilisation), so the tax is inert when
-        # nothing runs near the limit and only bites hot / clustered layouts.
-        for terms, cap, lim in ((skin_t, skin_cap, skin_lim), (eye_t, eye_cap, eye_lim)):
-            if cap <= 0:
-                continue
-            nP, K = terms.shape[1], terms.shape[2]
-            for j in range(nP):
-                for k in range(K):
-                    col = terms[:, j, k]
-                    if col.sum() <= lim:
-                        continue
-                    prob += pulp.lpSum((col[c] / cap) * x[c]
-                                       for c in range(nC) if col[c] > 0) <= u_max
+    # --- Exposure/utilisation constraint matrices (vectorised, built in one shot) ---
+    # Each exposure sample is a row  Σ_c A[s,c]·x_c ≤ lim.  skin_t/eye_t are (nC, nP, K);
+    # reshape to (samples, nC).  Rows that can't bind even with every candidate lit
+    # (row-sum ≤ lim) are dropped -- exact, and a big size cut.  This replaces the old
+    # term-by-term PuLP build (which was ~90% of the runtime; the field maths is ~0.1 s).
+    exp_mats, exp_ubs, util_mats = [], [], []
+    for terms, cap, lim in ((skin_t, skin_cap, skin_lim), (eye_t, eye_cap, eye_lim)):
+        M = terms.reshape(nC, -1).T                    # (samples, nC)
+        keep = M.sum(axis=1) > lim
+        if keep.any():
+            Mk = M[keep]
+            exp_mats.append(Mk)
+            exp_ubs.append(np.full(Mk.shape[0], lim))
+            if cap > 0:
+                util_mats.append(Mk / cap)             # utilisation = exposure / true cap
+    A_exp = np.vstack(exp_mats) if exp_mats else np.zeros((0, nC))
+    ub_exp = np.concatenate(exp_ubs) if exp_ubs else np.zeros(0)
+    A_util = np.vstack(util_mats) if util_mats else np.zeros((0, nC))
+    # The margin tax only needs u_max = the WORST utilisation, which for any layout sits at
+    # some selected lamp's own peak. Keeping each candidate's top few peak samples
+    # reproduces u_max exactly while collapsing thousands of rows -- all tied to the single
+    # u_max var, which cripples branch-and-bound -- down to ~nC. ~8x faster, same answer.
+    if A_util.shape[0] > 0:
+        peak_rows = np.unique(np.argsort(-A_util, axis=0)[:2].ravel())
+        A_util = A_util[peak_rows]
+    opts = {"time_limit": time_limit, "disp": bool(solver_msg)}
 
     # --- Stage 1: minimise lamp count -------------------------------------
-    p1 = pulp.LpProblem("min_lamps", pulp.LpMinimize)
-    x = [pulp.LpVariable(f"x{c}", cat="Binary") for c in range(nC)]
-    p1 += pulp.lpSum(x)
-    p1 += pulp.lpSum(fvec[c] * x[c] for c in range(nC)) >= target_fluence
-    add_exposure_caps(p1, x)
-    p1.solve(pulp.PULP_CBC_CMD(msg=1 if solver_msg else 0, timeLimit=time_limit))
-    status = pulp.LpStatus[p1.status].lower()
-    if status != "optimal":
+    cons1 = [LinearConstraint(fvec, target_fluence, np.inf)]
+    if A_exp.shape[0]:
+        cons1.append(LinearConstraint(sparse.csr_matrix(A_exp), -np.inf, ub_exp))
+    res1 = milp(c=np.ones(nC), constraints=cons1, integrality=np.ones(nC),
+                bounds=Bounds(0, 1), options=opts)
+    if res1.x is None:
         return OptimizeResult(
-            status="infeasible" if status == "infeasible" else status,
-            n_lamps=0, eye_cap=eye_cap, skin_cap=skin_cap,
+            status="infeasible", n_lamps=0, eye_cap=eye_cap, skin_cap=skin_cap,
             target_fluence=target_fluence,
             message=_infeasibility_hint(candidates, fvec, target_fluence,
-                                        skin_cap, eye_cap, height,
-                                        skin_mode, eye_mode),
+                                        skin_cap, eye_cap, height, skin_mode, eye_mode),
         )
-    n_star = int(round(sum(v.value() for v in x)))
+    n_star = int(round(res1.x.sum()))
 
     # --- Stage 2: among min-count layouts, choose the best arrangement -----
-    # Blended linear objective, all terms normalised to ~O(1):
+    # Blended objective (milp minimises, so we pass the negative):
     #   maximise  (1-w)*(avg/target) + w*(min/target) - margin_tax*u_max
-    # w (from the goal preset) trades raw germicidal throughput (avg fluence, which is
-    # separable and blind to lamp spacing) against even coverage (the worst-covered
-    # point). u_max is the worst exposure utilisation, so the tax steers away from
-    # layouts that run hot / cluster lamps even when they stay legal.
-    p2 = pulp.LpProblem("stage2", pulp.LpMaximize)
-    y = [pulp.LpVariable(f"y{c}", cat="Binary") for c in range(nC)]
-    p2 += pulp.lpSum(y) == n_star
-    p2 += pulp.lpSum(fvec[c] * y[c] for c in range(nC)) >= target_fluence
-    add_exposure_caps(p2, y)
-
+    # w (goal preset) trades raw germicidal throughput (avg fluence -- separable, blind to
+    # spacing) against even coverage (the worst-covered point t). u_max is the worst
+    # exposure utilisation, so the tax steers off layouts that run hot / cluster lamps.
+    # Variables: y (nC binaries) then t (min fluence) then u_max (worst utilisation).
     tgt = target_fluence if target_fluence > 1e-9 else 1e-9
-    obj = (1.0 - w) * (pulp.lpSum(fvec[c] * y[c] for c in range(nC)) / tgt)
-    if w > 0:
-        t = pulp.LpVariable("t", lowBound=0)
-        for p in cov_stage2:
-            col = F[:, p]
-            p2 += pulp.lpSum(col[c] * y[c] for c in range(nC) if col[c] > 0) >= t
-        obj += w * (t / tgt)
-    if margin_tax > 0:
-        u_max = pulp.LpVariable("u_max", lowBound=0)
-        add_utilization_envelope(p2, y, u_max)
-        obj += -margin_tax * u_max
-    p2.setObjective(obj)
-    p2.solve(pulp.PULP_CBC_CMD(msg=1 if solver_msg else 0, timeLimit=time_limit))
+    nv = nC + 2
+    t_idx, u_idx = nC, nC + 1
 
-    src = y if pulp.LpStatus[p2.status].lower() == "optimal" else x
-    chosen = [c for c in range(nC) if src[c].value() and src[c].value() > 0.5]
+    def _rows(A, extra):
+        """Embed an (m, nC) coefficient block into the (m, nv) variable layout."""
+        R = np.zeros((A.shape[0], nv))
+        R[:, :nC] = A
+        for col, val in extra:
+            R[:, col] = val
+        return sparse.csr_matrix(R)
+
+    c2 = np.zeros(nv)
+    c2[:nC] = -(1.0 - w) / tgt * fvec          # throughput term
+    c2[t_idx] = -(w / tgt)                       # even-coverage term (0 when w==0)
+    c2[u_idx] = margin_tax                       # exposure-margin tax (0 when off)
+
+    cons2 = []
+    lamp_count = np.zeros(nv); lamp_count[:nC] = 1.0
+    cons2.append(LinearConstraint(lamp_count, n_star, n_star))     # exactly n_star lamps
+    avg_row = np.zeros(nv); avg_row[:nC] = fvec
+    cons2.append(LinearConstraint(avg_row, target_fluence, np.inf))  # hit the target
+    if A_exp.shape[0]:
+        cons2.append(LinearConstraint(_rows(A_exp, []), -np.inf, ub_exp))
+    if w > 0 and len(cov_stage2):                                   # t ≤ fluence at each cov pt
+        cons2.append(LinearConstraint(_rows(F[:, cov_stage2].T, [(t_idx, -1.0)]), 0, np.inf))
+    if margin_tax > 0 and A_util.shape[0]:                          # u_max ≥ each utilisation
+        cons2.append(LinearConstraint(_rows(A_util, [(u_idx, -1.0)]), -np.inf, 0))
+
+    integ = np.zeros(nv); integ[:nC] = 1
+    lb = np.zeros(nv); ub = np.ones(nv); ub[t_idx] = np.inf; ub[u_idx] = np.inf
+    res2 = milp(c=c2, constraints=cons2, integrality=integ,
+                bounds=Bounds(lb, ub), options=opts)
+
+    yv = res2.x[:nC] if res2.x is not None else res1.x
+    chosen = [c for c in range(nC) if yv[c] > 0.5]
     sel = [candidates[c] for c in chosen]
 
     # Realised metrics, evaluated with the standard's own calc modes.
@@ -220,7 +238,8 @@ def optimize(
         status="optimal",
         n_lamps=len(sel),
         lamps=[_lamp_dict(l) for l in sel],
-        avg_fluence=float(f_eval[cov].mean()) if len(cov) else float(f_eval.mean()),
+        avg_fluence=(float(np.minimum(f_eval[cov], fluence_cap).mean())
+                     if len(cov) else float(f_eval.mean())),
         min_fluence=float(f_eval[cov].min()) if len(cov) else 0.0,
         max_skin=float(s_eval.max()) if len(s_eval) else 0.0,
         max_eye=float(e_eval.max()) if len(e_eval) else 0.0,

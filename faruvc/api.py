@@ -35,6 +35,7 @@ class OptimizeRequest(BaseModel):
     standard: str = "rp27_1"         # "rp27_1" | "ul8802" | "icnirp"
     mode: str = "downlight"          # "downlight" | "corner_edge"
     goal: str = "throughput"         # "throughput" | "balanced" | "coverage"
+    fluence_cap: float = 20.0        # µW/cm² above which a point's fluence isn't a real gain
     occupant_height: float | None = None   # None -> use the standard's plane height
 
 
@@ -54,6 +55,7 @@ def run_optimize(req: OptimizeRequest) -> dict:
         standard=standard,
         mode=req.mode,
         goal=req.goal,
+        fluence_cap=req.fluence_cap,
         spectrum_csv=str(_B1_SPECTRUM),
         occupant_height=req.occupant_height,
     )
