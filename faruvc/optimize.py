@@ -107,16 +107,19 @@ def optimize(
     eye_t = np.stack(eye_t)                    # (nC, nP, Ke)
     for c, lamp in enumerate(candidates):
         F[c] = lamp.fluence(vol)
-    fvec = F.mean(axis=1)                      # mean fluence per candidate
-    # Coverage points: the occupied zone (floor up to coverage_top), where a dark spot
-    # actually matters and where every point is reachable by the downward-aimed lamps.
-    # Excluding the near-ceiling band (points level with the lamps, which no downlight can
-    # light) keeps the max-min term meaningful WITHOUT discarding genuinely dim-but-real
-    # corners the way a relative-brightness threshold did.
+    # Evaluation zone: the occupied band (floor up to coverage_top). BOTH the germicidal
+    # average AND the worst-spot minimum are measured here, not over the full volume.
+    # Points up near the ceiling sit centimetres from the lamps, where the 1/r^2 point-
+    # source model diverges (a grid point 2 cm from a lamp reads ~13000 uW/cm2). Averaging
+    # those in lets a layout inflate its "average" by parking a lamp next to a grid point
+    # instead of actually lighting the room -- which is exactly what the max-average goal
+    # was doing. Restricting to the occupied band drops the singular near-field (lamps
+    # mount above it) and matches the zone people/pathogens actually occupy.
     cov_top = min(coverage_top, room.height - 0.1)
     cov = np.where(vol[:, 2] <= cov_top)[0]
     if len(cov) == 0:
         cov = np.arange(len(vol))
+    fvec = F[:, cov].mean(axis=1)             # mean fluence per candidate (occupied zone)
     # Subsample coverage points used in the (heavier) max-min stage to keep it fast.
     if len(cov) > max_coverage_points:
         cov_stage2 = cov[np.linspace(0, len(cov) - 1, max_coverage_points).astype(int)]
@@ -217,7 +220,7 @@ def optimize(
         status="optimal",
         n_lamps=len(sel),
         lamps=[_lamp_dict(l) for l in sel],
-        avg_fluence=float(f_eval.mean()),
+        avg_fluence=float(f_eval[cov].mean()) if len(cov) else float(f_eval.mean()),
         min_fluence=float(f_eval[cov].min()) if len(cov) else 0.0,
         max_skin=float(s_eval.max()) if len(s_eval) else 0.0,
         max_eye=float(e_eval.max()) if len(e_eval) else 0.0,
