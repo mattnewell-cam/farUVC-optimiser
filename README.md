@@ -45,6 +45,9 @@ print(r.n_lamps, r.max_skin, r.skin_cap)
 
 **Tests:** `PYTHONPATH=. python tests/test_field.py` (inverse-square, downlight-eye,
 verified TLVs, and a `guv_calcs` cross-check that skips if the dev oracle is absent).
+Run the optimizer eval/performance suite with
+`.venv\Scripts\python.exe tests\optimizer_eval.py --quick` or omit `--quick` for the
+full room-shape suite.
 
 **Validation results:** our scalar fluence equals `guv_calcs.Lamp.irradiance_at` with
 ratio 1.0000 across angles/distances; total B1 radiant power 118.6 mW vs 118.2 mW
@@ -214,7 +217,14 @@ the per-point exposure caps are **linear** in the per-lamp contributions:
    Adding lamps raises both fluence (good) and exposure (bounded above), so the two
    constraints are in genuine tension — ILP balances them and returns the minimum
    feasible set. Infeasible ⇒ report "target unreachable under this limit/mode".
-4. **Continuous refinement** (`optimize.py`, scipy): nudge the selected lamps off the
+4. **Arrangement stage** (`optimize.py`, scipy/HiGHS): after the minimum lamp count
+   is known, a second MILP chooses the best same-count arrangement. The model applies
+   exact fixed-count reductions before solving. Small fixed-count arrangement spaces
+   are solved by exhaustive enumeration, which is also exact; larger ones use HiGHS
+   under a time budget. If the proof of optimality doesn't finish in time, the best
+   incumbent is returned (it converges to the optimum well before the proof does) and
+   flagged in `stage2_status` rather than discarded.
+5. **Continuous refinement** (`optimize.py`, scipy): nudge the selected lamps off the
    candidate grid (position + orientation) to improve uniformity / margin, keeping
    count fixed. Optional polish stage.
 

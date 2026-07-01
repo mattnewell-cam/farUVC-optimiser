@@ -15,6 +15,9 @@ by term, and it keeps the field maths (the cheap part) out of the solver's way.
 
 from __future__ import annotations
 
+import itertools
+import math
+import time
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -52,6 +55,12 @@ class OptimizeResult:
     max_util: float = 0.0             # worst exposure as a fraction of its cap (0..1)
     goal: str = ""                    # stage-2 goal preset actually used
     message: str = ""
+    candidate_count: int = 0
+    stage1_seconds: float = 0.0
+    stage2_seconds: float = 0.0
+    refine_seconds: float = 0.0
+    total_seconds: float = 0.0
+    stage2_status: str = ""
 
 
 def optimize(
@@ -74,10 +83,13 @@ def optimize(
     max_coverage_points: int = 400,
     refine: bool = True,
     refine_passes: int = 2,
-    time_limit: float = 10.0,
+    time_limit: float | None = 12.0,
+    stage2_time_limit: float | None = None,
+    exact_enum_limit: int = 1_500_000,
     solver_msg: bool = False,
     **candidate_kwargs,
 ) -> OptimizeResult:
+    t_total = time.perf_counter()
     if goal not in _GOAL_W:
         raise ValueError(f"unknown goal {goal!r}; expected one of {sorted(_GOAL_W)}")
     w = _GOAL_W[goal]
@@ -97,7 +109,8 @@ def optimize(
     if not candidates:
         return OptimizeResult("infeasible", 0, message="no candidate positions",
                               eye_cap=eye_cap, skin_cap=skin_cap,
-                              target_fluence=target_fluence)
+                              target_fluence=target_fluence,
+                              total_seconds=time.perf_counter() - t_total)
 
     vol = room.volume_grid(spacing=fluence_spacing)
     plane = room.plane_grid(z=height, spacing=plane_spacing)
@@ -158,31 +171,41 @@ def optimize(
     A_exp = np.vstack(exp_mats) if exp_mats else np.zeros((0, nC))
     ub_exp = np.concatenate(exp_ubs) if exp_ubs else np.zeros(0)
     A_util = np.vstack(util_mats) if util_mats else np.zeros((0, nC))
-    # The margin tax only needs u_max = the WORST utilisation, which for any layout sits at
-    # some selected lamp's own peak. Keeping each candidate's top few peak samples
-    # reproduces u_max exactly while collapsing thousands of rows -- all tied to the single
-    # u_max var, which cripples branch-and-bound -- down to ~nC. ~8x faster, same answer.
-    if A_util.shape[0] > 0:
-        peak_rows = np.unique(np.argsort(-A_util, axis=0)[:2].ravel())
-        A_util = A_util[peak_rows]
-    # A 1% optimality gap is far below the modelling noise here and lets HiGHS stop as
-    # soon as it has a provably near-optimal layout instead of grinding to close the gap.
-    opts = {"time_limit": time_limit, "mip_rel_gap": 0.01, "disp": bool(solver_msg)}
+    opts = _solver_options(time_limit, solver_msg)
+    opts2 = _solver_options(stage2_time_limit if stage2_time_limit is not None else time_limit,
+                            solver_msg)
 
     # --- Stage 1: minimise lamp count -------------------------------------
     cons1 = [LinearConstraint(fvec, target_fluence, np.inf)]
     if A_exp.shape[0]:
         cons1.append(LinearConstraint(sparse.csr_matrix(A_exp), -np.inf, ub_exp))
+    t_stage1 = time.perf_counter()
     res1 = milp(c=np.ones(nC), constraints=cons1, integrality=np.ones(nC),
                 bounds=Bounds(0, 1), options=opts)
+    stage1_seconds = time.perf_counter() - t_stage1
     if res1.x is None:
+        status = _milp_status(res1)
         return OptimizeResult(
-            status="infeasible", n_lamps=0, eye_cap=eye_cap, skin_cap=skin_cap,
+            status=status, n_lamps=0, eye_cap=eye_cap, skin_cap=skin_cap,
             target_fluence=target_fluence,
             message=_infeasibility_hint(candidates, fvec, target_fluence,
-                                        skin_cap, eye_cap, height, skin_mode, eye_mode),
+                                        skin_cap, eye_cap, height, skin_mode, eye_mode)
+                    if status == "infeasible" else str(res1.message),
+            candidate_count=nC,
+            stage1_seconds=stage1_seconds,
+            total_seconds=time.perf_counter() - t_total,
         )
     n_star = int(round(res1.x.sum()))
+
+    active = _stage2_candidate_mask(fvec, n_star, target_fluence)
+    active_idx = np.flatnonzero(active)
+    candidates2 = [candidates[i] for i in active_idx]
+    fvec2 = fvec[active]
+    F2 = F[active]
+    A_exp2 = A_exp[:, active] if A_exp.shape[0] else A_exp
+    A_util2 = A_util[:, active] if A_util.shape[0] else A_util
+    nS = len(candidates2)
+    A_exp_stage2, ub_exp_stage2 = _stage2_exposure_rows(A_exp2, ub_exp, n_star)
 
     # --- Stage 2: among min-count layouts, choose the best arrangement -----
     # Blended objective (milp minimises, so we pass the negative):
@@ -192,41 +215,84 @@ def optimize(
     # exposure utilisation, so the tax steers off layouts that run hot / cluster lamps.
     # Variables: y (nC binaries) then t (min fluence) then u_max (worst utilisation).
     tgt = target_fluence if target_fluence > 1e-9 else 1e-9
-    nv = nC + 2
-    t_idx, u_idx = nC, nC + 1
+    nv = nS + 2
+    t_idx, u_idx = nS, nS + 1
 
     def _rows(A, extra):
-        """Embed an (m, nC) coefficient block into the (m, nv) variable layout."""
+        """Embed an (m, nS) coefficient block into the (m, nv) variable layout."""
         R = np.zeros((A.shape[0], nv))
-        R[:, :nC] = A
+        R[:, :nS] = A
         for col, val in extra:
             R[:, col] = val
         return sparse.csr_matrix(R)
 
     c2 = np.zeros(nv)
-    c2[:nC] = -(1.0 - w) / tgt * fvec          # throughput term
+    c2[:nS] = -(1.0 - w) / tgt * fvec2         # throughput term
     c2[t_idx] = -(w / tgt)                       # even-coverage term (0 when w==0)
     c2[u_idx] = margin_tax                       # exposure-margin tax (0 when off)
 
     cons2 = []
-    lamp_count = np.zeros(nv); lamp_count[:nC] = 1.0
+    lamp_count = np.zeros(nv); lamp_count[:nS] = 1.0
     cons2.append(LinearConstraint(lamp_count, n_star, n_star))     # exactly n_star lamps
-    avg_row = np.zeros(nv); avg_row[:nC] = fvec
+    avg_row = np.zeros(nv); avg_row[:nS] = fvec2
     cons2.append(LinearConstraint(avg_row, target_fluence, np.inf))  # hit the target
-    if A_exp.shape[0]:
-        cons2.append(LinearConstraint(_rows(A_exp, []), -np.inf, ub_exp))
+    if A_exp_stage2.shape[0]:
+        cons2.append(LinearConstraint(_rows(A_exp_stage2, []), -np.inf, ub_exp_stage2))
     if w > 0 and len(cov_stage2):                                   # t ≤ fluence at each cov pt
-        cons2.append(LinearConstraint(_rows(F[:, cov_stage2].T, [(t_idx, -1.0)]), 0, np.inf))
-    if margin_tax > 0 and A_util.shape[0]:                          # u_max ≥ each utilisation
-        cons2.append(LinearConstraint(_rows(A_util, [(u_idx, -1.0)]), -np.inf, 0))
+        cons2.append(LinearConstraint(_rows(F2[:, cov_stage2].T, [(t_idx, -1.0)]), 0, np.inf))
+    if margin_tax > 0 and A_util2.shape[0]:
+        cons2.append(LinearConstraint(_rows(A_util2, [(u_idx, -1.0)]), -np.inf, 0))
 
-    integ = np.zeros(nv); integ[:nC] = 1
+    integ = np.zeros(nv); integ[:nS] = 1
     lb = np.zeros(nv); ub = np.ones(nv); ub[t_idx] = np.inf; ub[u_idx] = np.inf
-    res2 = milp(c=c2, constraints=cons2, integrality=integ,
-                bounds=Bounds(lb, ub), options=opts)
+    t_stage2 = time.perf_counter()
+    combo_count = math.comb(nS, n_star) if 0 <= n_star <= nS else 0
+    enum_choice = None
+    if 0 < combo_count <= exact_enum_limit:
+        enum_choice = _enumerate_stage2(
+            nS, n_star, fvec2, F2[:, cov_stage2].T if w > 0 else None,
+            A_exp_stage2, ub_exp_stage2, A_util2 if margin_tax > 0 else None,
+            target_fluence, w, margin_tax,
+        )
+        stage2_seconds = time.perf_counter() - t_stage2
+        if enum_choice is None:
+            return OptimizeResult(
+                status="infeasible", n_lamps=n_star,
+                eye_cap=eye_cap, skin_cap=skin_cap, target_fluence=target_fluence,
+                message="no exact stage-2 combination satisfies the fixed-count constraints",
+                candidate_count=nC,
+                stage1_seconds=stage1_seconds,
+                stage2_seconds=stage2_seconds,
+                total_seconds=time.perf_counter() - t_total,
+                stage2_status="exact enumeration found no feasible arrangement",
+            )
+        chosen2 = enum_choice
+        stage2_status = f"exact enumeration over {combo_count} combinations"
+    else:
+        res2 = milp(c=c2, constraints=cons2, integrality=integ,
+                    bounds=Bounds(lb, ub), options=opts2)
+        stage2_seconds = time.perf_counter() - t_stage2
 
-    yv = res2.x[:nC] if res2.x is not None else res1.x
-    chosen = [c for c in range(nC) if yv[c] > 0.5]
+        # Graceful degradation: on a time limit HiGHS still returns its best incumbent,
+        # which (measured on symmetric rooms) reaches the optimum well before the proof of
+        # optimality finishes. So we USE the incumbent and only fail if no feasible layout
+        # was found at all -- rather than discarding a good answer just because the last
+        # fraction of a percent wasn't formally closed.
+        if res2.x is None:
+            return OptimizeResult(
+                status=_milp_status(res2), n_lamps=n_star,
+                eye_cap=eye_cap, skin_cap=skin_cap, target_fluence=target_fluence,
+                message=str(res2.message),
+                candidate_count=nC,
+                stage1_seconds=stage1_seconds,
+                stage2_seconds=stage2_seconds,
+                total_seconds=time.perf_counter() - t_total,
+                stage2_status=str(res2.message),
+            )
+        chosen2 = _solution_indices(res2.x, nS, n_star)
+        stage2_status = ("optimal" if res2.success
+                         else "time limit — best incumbent (near-optimal)")
+    chosen = [int(active_idx[c]) for c in chosen2]
     sel = [candidates[c] for c in chosen]
 
     # --- Continuous refine: the MILP only chose which wall/corner each lamp sits on (a
@@ -234,10 +300,13 @@ def optimize(
     # fan-azimuth) with a local optimiser -- the objective is smooth once a lamp is fixed
     # to a wall, so this reaches the true optimum between grid points without a fine (and
     # slow) candidate grid. Each layout eval is ~1.6 ms, so this is cheap.
+    refine_seconds = 0.0
     if refine and sel:
+        t_refine = time.perf_counter()
         sel = _refine_layout(sel, photometry, room, vol[cov], plane, skin_mode, eye_mode,
                              skin_cap, eye_cap, fluence_cap, w, margin_tax, tgt,
                              n_az=8, cap_margin=cap_margin, passes=refine_passes)
+        refine_seconds = time.perf_counter() - t_refine
 
     # Realised metrics, evaluated with the standard's own calc modes.
     f_eval = fluence_field(sel, vol)
@@ -261,7 +330,120 @@ def optimize(
         max_util=float(max_util), goal=goal,
         message=(f"{len(sel)} lamp(s) | {standard.label} | goal={goal} | "
                  f"eye={eye_mode}, skin={skin_mode} @ {height:.2f} m | {nC} candidates"),
+        candidate_count=nC,
+        stage1_seconds=stage1_seconds,
+        stage2_seconds=stage2_seconds,
+        refine_seconds=refine_seconds,
+        total_seconds=time.perf_counter() - t_total,
+        stage2_status=stage2_status,
     )
+
+
+# --- exact MILP reductions ------------------------------------------------
+def _solver_options(time_limit: float | None, solver_msg: bool) -> dict:
+    opts = {"mip_rel_gap": 0.01, "disp": bool(solver_msg)}
+    if time_limit is not None:
+        opts["time_limit"] = float(time_limit)
+    return opts
+
+
+def _milp_status(res) -> str:
+    if res.success:
+        return "optimal"
+    if res.status == 1:
+        return "time_limit"
+    if res.status == 2:
+        return "infeasible"
+    if res.status == 3:
+        return "unbounded"
+    return "solver_failed"
+
+
+def _solution_indices(x, nC: int, n_star: int) -> list[int]:
+    if x is None:
+        return []
+    y = np.asarray(x[:nC], dtype=float)
+    chosen = [int(i) for i in np.flatnonzero(y > 0.5)]
+    if len(chosen) == n_star:
+        return chosen
+    return [int(i) for i in np.argsort(-y)[:n_star] if y[i] > 1e-7]
+
+
+def _stage2_candidate_mask(fvec: np.ndarray, n_star: int, target: float) -> np.ndarray:
+    """Candidates that can appear in some target-hitting n_star-lamp solution."""
+    nC = len(fvec)
+    if n_star <= 1:
+        return fvec + 1e-12 >= target
+    order = np.argsort(-fvec)
+    prefix = np.concatenate([[0.0], np.cumsum(fvec[order])])
+    keep = np.zeros(nC, dtype=bool)
+    for i in range(nC):
+        need = n_star - 1
+        if i in order[:need]:
+            others = prefix[need + 1] - fvec[i]
+        else:
+            others = prefix[need]
+        keep[i] = fvec[i] + others + 1e-12 >= target
+    return keep
+
+
+def _stage2_exposure_rows(A_exp: np.ndarray, ub_exp: np.ndarray,
+                          n_star: int) -> tuple[np.ndarray, np.ndarray]:
+    """Drop exposure rows that cannot bind with exactly n_star selected lamps."""
+    if A_exp.shape[0] == 0:
+        return A_exp, ub_exp
+    k = min(max(1, n_star), A_exp.shape[1])
+    top_sum = np.partition(A_exp, -k, axis=1)[:, -k:].sum(axis=1)
+    keep = top_sum > ub_exp + 1e-12
+    return A_exp[keep], ub_exp[keep]
+
+
+def _enumerate_stage2(nC: int, n_star: int, fvec: np.ndarray,
+                      F_cov: np.ndarray | None, A_exp: np.ndarray,
+                      ub_exp: np.ndarray, A_util: np.ndarray | None,
+                      target: float, w: float, margin_tax: float,
+                      chunk_size: int = 2000) -> list[int] | None:
+    """Exact fixed-count arrangement solve by exhaustive combination search."""
+    best_score = -np.inf
+    best_combo = None
+    tgt = target if target > 1e-9 else 1e-9
+    combos_iter = itertools.combinations(range(nC), n_star)
+
+    while True:
+        chunk = list(itertools.islice(combos_iter, chunk_size))
+        if not chunk:
+            break
+        C = np.asarray(chunk, dtype=np.int32)
+        avg = fvec[C].sum(axis=1)
+        feasible = avg + 1e-8 >= target
+        if not feasible.any():
+            continue
+        C = C[feasible]
+        avg = avg[feasible]
+
+        if A_exp.shape[0]:
+            exposure = A_exp[:, C].sum(axis=2)
+            feasible = (exposure <= ub_exp[:, None] + 1e-7).all(axis=0)
+            if not feasible.any():
+                continue
+            C = C[feasible]
+            avg = avg[feasible]
+
+        min_cov = 0.0
+        if w > 0 and F_cov is not None and F_cov.size:
+            min_cov = F_cov[:, C].sum(axis=2).min(axis=0)
+
+        util = 0.0
+        if margin_tax > 0 and A_util is not None and A_util.size:
+            util = A_util[:, C].sum(axis=2).max(axis=0)
+
+        score = (1.0 - w) * avg / tgt + w * min_cov / tgt - margin_tax * util
+        j = int(np.argmax(score))
+        if float(score[j]) > best_score + 1e-12:
+            best_score = float(score[j])
+            best_combo = C[j].astype(int).tolist()
+
+    return best_combo
 
 
 # --- continuous refinement ------------------------------------------------
