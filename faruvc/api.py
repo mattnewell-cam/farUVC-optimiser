@@ -34,6 +34,7 @@ class OptimizeRequest(BaseModel):
     target_fluence: float = 1.0
     standard: str = "rp27_1"         # "rp27_1" | "ul8802" | "icnirp"
     mode: str = "downlight"          # "downlight" | "corner_edge"
+    goal: str = "throughput"         # "throughput" | "balanced" | "coverage"
     occupant_height: float | None = None   # None -> use the standard's plane height
 
 
@@ -52,6 +53,7 @@ def run_optimize(req: OptimizeRequest) -> dict:
         target_fluence=req.target_fluence,
         standard=standard,
         mode=req.mode,
+        goal=req.goal,
         spectrum_csv=str(_B1_SPECTRUM),
         occupant_height=req.occupant_height,
     )
@@ -69,7 +71,9 @@ def run_optimize(req: OptimizeRequest) -> dict:
             "skin_cap": result.skin_cap,
             "eye_cap": result.eye_cap,
             "target_fluence": result.target_fluence,
+            "max_util": result.max_util,
         },
+        "goal": result.goal,
         "standard_label": standard.label,
     }
 

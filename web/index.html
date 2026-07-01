@@ -74,6 +74,13 @@
         <option value="corner_edge">Allow corner / edge lamps</option>
       </select>
     </label>
+    <label>Optimisation goal
+      <select id="goal">
+        <option value="throughput">Throughput — max average fluence</option>
+        <option value="balanced">Balanced</option>
+        <option value="coverage">Even coverage — fewest cold spots</option>
+      </select>
+    </label>
     <label>Assessment plane height (m)
       <input id="occ" type="number" value="1.8" step="0.1" min="0.5" max="2.5"/>
     </label>
@@ -180,12 +187,30 @@ function draw(){
   }); }
 }
 
+// --- shareable state: encode the whole setup in the URL hash ---------------
+function currentState(){
+  return { vertices: pts, height:+height.value, target_fluence:+target.value,
+           standard:standard.value, mode:mode.value, goal:goal.value,
+           occupant_height:+occ.value };
+}
+function applyState(st){
+  if(!st || !Array.isArray(st.vertices) || st.vertices.length<3) return false;
+  pts = st.vertices.map(p=>[+p[0], +p[1]]); closed = true;
+  const set=(id,v)=>{ if(v!=null && v!=='') document.getElementById(id).value=v; };
+  set('height',st.height); set('target',st.target_fluence); set('standard',st.standard);
+  set('mode',st.mode); set('goal',st.goal); set('occ',st.occupant_height);
+  return true;
+}
+function loadFromHash(){
+  if(!location.hash.startsWith('#s=')) return false;
+  try { return applyState(JSON.parse(decodeURIComponent(location.hash.slice(3)))); }
+  catch(e){ return false; }
+}
+
 document.getElementById('run').onclick = async ()=>{
   if(!closed || pts.length<3){ setStatus('Draw and close a room first.'); return; }
-  const body = {
-    vertices: pts, height:+height.value, target_fluence:+target.value,
-    standard:standard.value, mode:mode.value, occupant_height:+occ.value,
-  };
+  const body = currentState();
+  location.hash = 's=' + encodeURIComponent(JSON.stringify(body));  // make this setup shareable
   setStatus('Optimising…'); document.getElementById('run').disabled=true;
   try{
     const res = await fetch('/optimize',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
@@ -209,7 +234,8 @@ function render(){
     <div class="metric"><span>Avg fluence</span><b>${m.avg_fluence.toFixed(2)} / ${m.target_fluence.toFixed(2)} µW/cm²</b></div>
     <div class="metric"><span>Min fluence (covered)</span><b>${m.min_fluence.toFixed(2)} µW/cm²</b></div>
     <div class="metric"><span>Max skin</span><b>${m.max_skin.toFixed(2)} / ${m.skin_cap.toFixed(2)} <span class="pill ${skinOk?'ok':'bad'}">${skinOk?'ok':'over'}</span></b></div>
-    <div class="metric"><span>Max eye</span><b>${m.max_eye.toFixed(2)} / ${m.eye_cap.toFixed(2)} <span class="pill ${eyeOk?'ok':'bad'}">${eyeOk?'ok':'over'}</span></b></div>`;
+    <div class="metric"><span>Max eye</span><b>${m.max_eye.toFixed(2)} / ${m.eye_cap.toFixed(2)} <span class="pill ${eyeOk?'ok':'bad'}">${eyeOk?'ok':'over'}</span></b></div>
+    ${m.max_util!=null?`<div class="metric"><span>Peak exposure</span><b>${(m.max_util*100).toFixed(0)}% of limit <span class="hint">(${((1-m.max_util)*100).toFixed(0)}% headroom)</span></b></div>`:''}`;
   if(r.heatmap){ document.getElementById('legend').style.display='block';
     const ll=document.getElementById('legendLabel'); ll.style.display='block';
     const pk = r.heatmap.peak ? `, peak ${r.heatmap.peak.toFixed(1)}` : '';
@@ -217,7 +243,10 @@ function render(){
   document.getElementById('message').textContent = r.message||'';
 }
 
-draw();
+// On open: if the URL carries a saved setup, draw it and compute automatically so the
+// link lands on a finished result — no redraw / re-click needed.
+if(loadFromHash()){ draw(); document.getElementById('run').click(); }
+else draw();
 </script>
 </body>
 </html>

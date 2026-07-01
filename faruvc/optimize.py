@@ -28,6 +28,12 @@ from .regs import ExposureLimits, Standard, limits_for_spectrum
 
 _Z = np.array([0.0, 0.0, 1.0])
 
+# Stage-2 goal presets -> coverage weight w in the blended objective:
+#   throughput : pure average fluence (max germicidal delivery; best for most rooms)
+#   balanced   : mostly average, with some weight on the worst-covered point
+#   coverage   : pure max-min (even coverage; best for corridors / L-shaped rooms)
+_GOAL_W = {"throughput": 0.0, "balanced": 0.4, "coverage": 1.0}
+
 
 @dataclass
 class OptimizeResult:
@@ -41,6 +47,8 @@ class OptimizeResult:
     skin_cap: float = 0.0
     eye_cap: float = 0.0
     target_fluence: float = 0.0
+    max_util: float = 0.0             # worst exposure as a fraction of its cap (0..1)
+    goal: str = ""                    # stage-2 goal preset actually used
     message: str = ""
 
 
@@ -51,9 +59,12 @@ def optimize(
     standard: Standard,
     mode: str = "downlight",
     *,
+    goal: str = "throughput",
+    margin_tax: float = 0.2,
     spectrum_csv: str | None = None,
     fluence_spacing: float = 0.4,
     plane_spacing: float = 0.4,
+    coverage_top: float = 2.0,
     occupant_height: float | None = None,
     n_azimuths: int = 16,
     cap_margin: float = 0.95,
@@ -62,6 +73,10 @@ def optimize(
     solver_msg: bool = False,
     **candidate_kwargs,
 ) -> OptimizeResult:
+    if goal not in _GOAL_W:
+        raise ValueError(f"unknown goal {goal!r}; expected one of {sorted(_GOAL_W)}")
+    w = _GOAL_W[goal]
+
     limits = _limits(standard, spectrum_csv)
     eye_cap, skin_cap = limits.eye_uw, limits.skin_uw
     # Constrain to a margin inside the true caps so azimuth/grid discretisation error
@@ -93,10 +108,15 @@ def optimize(
     for c, lamp in enumerate(candidates):
         F[c] = lamp.fluence(vol)
     fvec = F.mean(axis=1)                      # mean fluence per candidate
-    # Coverage points: where fluence is physically achievable (exclude dead points
-    # coplanar with the ceiling lamps, where B1 emits ~0). Keeps maximin meaningful.
-    allon = F.sum(axis=0)
-    cov = np.where(allon >= 0.05 * allon.max())[0] if allon.max() > 0 else np.arange(len(vol))
+    # Coverage points: the occupied zone (floor up to coverage_top), where a dark spot
+    # actually matters and where every point is reachable by the downward-aimed lamps.
+    # Excluding the near-ceiling band (points level with the lamps, which no downlight can
+    # light) keeps the max-min term meaningful WITHOUT discarding genuinely dim-but-real
+    # corners the way a relative-brightness threshold did.
+    cov_top = min(coverage_top, room.height - 0.1)
+    cov = np.where(vol[:, 2] <= cov_top)[0]
+    if len(cov) == 0:
+        cov = np.arange(len(vol))
     # Subsample coverage points used in the (heavier) max-min stage to keep it fast.
     if len(cov) > max_coverage_points:
         cov_stage2 = cov[np.linspace(0, len(cov) - 1, max_coverage_points).astype(int)]
@@ -115,6 +135,23 @@ def optimize(
                     if col.sum() <= lim:
                         continue
                     prob += pulp.lpSum(col[c] * x[c] for c in range(nC) if col[c] > 0) <= lim
+
+    def add_utilization_envelope(prob, x, u_max):
+        # u_max >= realised exposure / true cap, over the same near-cap samples used for
+        # the hard caps. Samples that can't approach the cap even with every candidate on
+        # are skipped (they can never set the worst utilisation), so the tax is inert when
+        # nothing runs near the limit and only bites hot / clustered layouts.
+        for terms, cap, lim in ((skin_t, skin_cap, skin_lim), (eye_t, eye_cap, eye_lim)):
+            if cap <= 0:
+                continue
+            nP, K = terms.shape[1], terms.shape[2]
+            for j in range(nP):
+                for k in range(K):
+                    col = terms[:, j, k]
+                    if col.sum() <= lim:
+                        continue
+                    prob += pulp.lpSum((col[c] / cap) * x[c]
+                                       for c in range(nC) if col[c] > 0) <= u_max
 
     # --- Stage 1: minimise lamp count -------------------------------------
     p1 = pulp.LpProblem("min_lamps", pulp.LpMinimize)
@@ -135,18 +172,32 @@ def optimize(
         )
     n_star = int(round(sum(v.value() for v in x)))
 
-    # --- Stage 2: among min-count layouts, maximise the minimum fluence ----
-    # (the "best arrangement" — spreads lamps for uniform coverage)
-    p2 = pulp.LpProblem("max_min_fluence", pulp.LpMaximize)
+    # --- Stage 2: among min-count layouts, choose the best arrangement -----
+    # Blended linear objective, all terms normalised to ~O(1):
+    #   maximise  (1-w)*(avg/target) + w*(min/target) - margin_tax*u_max
+    # w (from the goal preset) trades raw germicidal throughput (avg fluence, which is
+    # separable and blind to lamp spacing) against even coverage (the worst-covered
+    # point). u_max is the worst exposure utilisation, so the tax steers away from
+    # layouts that run hot / cluster lamps even when they stay legal.
+    p2 = pulp.LpProblem("stage2", pulp.LpMaximize)
     y = [pulp.LpVariable(f"y{c}", cat="Binary") for c in range(nC)]
-    t = pulp.LpVariable("t", lowBound=0)
-    p2 += t
     p2 += pulp.lpSum(y) == n_star
     p2 += pulp.lpSum(fvec[c] * y[c] for c in range(nC)) >= target_fluence
-    for p in cov_stage2:
-        col = F[:, p]
-        p2 += pulp.lpSum(col[c] * y[c] for c in range(nC) if col[c] > 0) >= t
     add_exposure_caps(p2, y)
+
+    tgt = target_fluence if target_fluence > 1e-9 else 1e-9
+    obj = (1.0 - w) * (pulp.lpSum(fvec[c] * y[c] for c in range(nC)) / tgt)
+    if w > 0:
+        t = pulp.LpVariable("t", lowBound=0)
+        for p in cov_stage2:
+            col = F[:, p]
+            p2 += pulp.lpSum(col[c] * y[c] for c in range(nC) if col[c] > 0) >= t
+        obj += w * (t / tgt)
+    if margin_tax > 0:
+        u_max = pulp.LpVariable("u_max", lowBound=0)
+        add_utilization_envelope(p2, y, u_max)
+        obj += -margin_tax * u_max
+    p2.setObjective(obj)
     p2.solve(pulp.PULP_CBC_CMD(msg=1 if solver_msg else 0, timeLimit=time_limit))
 
     src = y if pulp.LpStatus[p2.status].lower() == "optimal" else x
@@ -157,6 +208,10 @@ def optimize(
     f_eval = fluence_field(sel, vol)
     s_eval = exposure_field(sel, plane, skin_mode, n_az=max(16, n_azimuths))
     e_eval = exposure_field(sel, plane, eye_mode, n_az=max(16, n_azimuths))
+    max_util = max(
+        (float(s_eval.max()) / skin_cap) if (len(s_eval) and skin_cap > 0) else 0.0,
+        (float(e_eval.max()) / eye_cap) if (len(e_eval) and eye_cap > 0) else 0.0,
+    )
 
     return OptimizeResult(
         status="optimal",
@@ -167,8 +222,9 @@ def optimize(
         max_skin=float(s_eval.max()) if len(s_eval) else 0.0,
         max_eye=float(e_eval.max()) if len(e_eval) else 0.0,
         skin_cap=skin_cap, eye_cap=eye_cap, target_fluence=target_fluence,
-        message=(f"{len(sel)} lamp(s) | {standard.label} | eye={eye_mode}, "
-                 f"skin={skin_mode} @ {height:.2f} m | {nC} candidates"),
+        max_util=float(max_util), goal=goal,
+        message=(f"{len(sel)} lamp(s) | {standard.label} | goal={goal} | "
+                 f"eye={eye_mode}, skin={skin_mode} @ {height:.2f} m | {nC} candidates"),
     )
 
 
