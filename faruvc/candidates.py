@@ -51,7 +51,8 @@ def generate_candidates(
     # count (and solve time) down.
     dl_spacing = grid_spacing if mode == "downlight" else max(grid_spacing, 1.0)
     for xy in _interior_grid(room, dl_spacing, wall_inset):
-        candidates.append(LampInstance(photometry, pos=(xy[0], xy[1], z_ceil), aim=DOWN))
+        candidates.append(LampInstance(photometry, pos=(xy[0], xy[1], z_ceil), aim=DOWN,
+                                       meta={"mount": "ceiling", "h": z_ceil}))
 
     if mode == "downlight":
         return candidates
@@ -73,8 +74,13 @@ def generate_candidates(
         for k in range(npts):
             t = (k + 0.5) / npts
             base = p0 + t * edge + n_in * edge_inset
-            for aim in _aim_sweep(n_in, tilts, aim_azimuths, azimuth_spread_deg):
-                candidates.append(LampInstance(photometry, pos=(base[0], base[1], h), aim=aim))
+            for off, td in _sweep(aim_azimuths, azimuth_spread_deg, tilts):
+                aim = _tilt_down(_rot2d(n_in, off), td)
+                meta = {"mount": "edge", "p0": p0.copy(), "p1": p1.copy(),
+                        "n_in": n_in.copy(), "inset": edge_inset, "h": h,
+                        "t": t, "tilt": td, "az": off}
+                candidates.append(LampInstance(photometry, pos=(base[0], base[1], h),
+                                               aim=aim, meta=meta))
 
     # Corner mounts: fan around the inward angle bisector.
     v = room.vertices
@@ -88,22 +94,27 @@ def generate_candidates(
         if not room.contains((cur + bis * 0.1)[None, :])[0]:
             bis = -bis
         base = cur + bis * edge_inset
-        for aim in _aim_sweep(bis, tilts, aim_azimuths, azimuth_spread_deg):
-            candidates.append(LampInstance(photometry, pos=(base[0], base[1], h), aim=aim))
+        for off, td in _sweep(aim_azimuths, azimuth_spread_deg, tilts):
+            aim = _tilt_down(_rot2d(bis, off), td)
+            meta = {"mount": "corner", "base": base.copy(), "bis": bis.copy(), "h": h,
+                    "tilt": td, "az": off}
+            candidates.append(LampInstance(photometry, pos=(base[0], base[1], h),
+                                           aim=aim, meta=meta))
 
     return candidates
 
 
-def _aim_sweep(inward2d, tilts, n_az, spread_deg):
-    """Aim directions: horizontal fan (±spread around the inward reference) × tilts."""
-    base = np.arctan2(inward2d[1], inward2d[0])
+def _sweep(n_az, spread_deg, tilts):
+    """Yield (azimuth_offset_rad, tilt_deg) over the horizontal fan × tilts."""
     offs = [0.0] if n_az <= 1 else np.radians(np.linspace(-spread_deg, spread_deg, n_az))
-    aims = []
     for off in offs:
-        horiz = np.array([np.cos(base + off), np.sin(base + off)])
         for td in tilts:
-            aims.append(_tilt_down(horiz, td))
-    return aims
+            yield float(off), float(td)
+
+
+def _rot2d(v, ang):
+    c, s = np.cos(ang), np.sin(ang)
+    return np.array([c * v[0] - s * v[1], s * v[0] + c * v[1]])
 
 
 # --- helpers --------------------------------------------------------------

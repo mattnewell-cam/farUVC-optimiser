@@ -35,6 +35,7 @@ class LampInstance:
     pos: np.ndarray                       # (3,) metres
     aim: np.ndarray = dc_field(default_factory=lambda: np.array([0.0, 0.0, -1.0]))
     dimming: float = 1.0                  # 0..1 output scale
+    meta: dict | None = None              # mount info for continuous refinement
 
     def __post_init__(self) -> None:
         self.pos = np.asarray(self.pos, dtype=float).reshape(3)

@@ -19,9 +19,9 @@ from dataclasses import dataclass, field
 
 import numpy as np
 from scipy import sparse
-from scipy.optimize import Bounds, LinearConstraint, milp
+from scipy.optimize import Bounds, LinearConstraint, milp, minimize
 
-from .candidates import generate_candidates
+from .candidates import DOWN, generate_candidates, _rot2d, _tilt_down
 from .field import (LampInstance, exposure_field, fluence_field,
                     lamp_exposure_terms)
 from .geometry import Room
@@ -72,7 +72,9 @@ def optimize(
     n_azimuths: int = 16,
     cap_margin: float = 0.95,
     max_coverage_points: int = 400,
-    time_limit: float = 15.0,
+    refine: bool = True,
+    refine_passes: int = 2,
+    time_limit: float = 10.0,
     solver_msg: bool = False,
     **candidate_kwargs,
 ) -> OptimizeResult:
@@ -227,6 +229,16 @@ def optimize(
     chosen = [c for c in range(nC) if yv[c] > 0.5]
     sel = [candidates[c] for c in chosen]
 
+    # --- Continuous refine: the MILP only chose which wall/corner each lamp sits on (a
+    # coarse candidate grid). Now polish each lamp's exact (position-along-wall, tilt,
+    # fan-azimuth) with a local optimiser -- the objective is smooth once a lamp is fixed
+    # to a wall, so this reaches the true optimum between grid points without a fine (and
+    # slow) candidate grid. Each layout eval is ~1.6 ms, so this is cheap.
+    if refine and sel:
+        sel = _refine_layout(sel, photometry, room, vol[cov], plane, skin_mode, eye_mode,
+                             skin_cap, eye_cap, fluence_cap, w, margin_tax, tgt,
+                             n_az=8, cap_margin=cap_margin, passes=refine_passes)
+
     # Realised metrics, evaluated with the standard's own calc modes.
     f_eval = fluence_field(sel, vol)
     s_eval = exposure_field(sel, plane, skin_mode, n_az=max(16, n_azimuths))
@@ -250,6 +262,90 @@ def optimize(
         message=(f"{len(sel)} lamp(s) | {standard.label} | goal={goal} | "
                  f"eye={eye_mode}, skin={skin_mode} @ {height:.2f} m | {nC} candidates"),
     )
+
+
+# --- continuous refinement ------------------------------------------------
+def _lamp_params(lamp, photometry, room):
+    """Return (x0, bounds, build, valid) for a lamp's refinable continuous params.
+
+    build(p) -> a new LampInstance; valid(p) -> is the position physically allowed.
+    Wall lamps slide along their wall (t) + tilt + fan azimuth; corner lamps keep their
+    position and vary tilt + azimuth; ceiling downlights move in (x, y).
+    """
+    m = lamp.meta or {}
+    kind = m.get("mount")
+    if kind == "edge":
+        p0, p1, n_in, inset, h = m["p0"], m["p1"], m["n_in"], m["inset"], m["h"]
+        x0 = [m.get("t", 0.5), m.get("tilt", 30.0), m.get("az", 0.0)]
+        bounds = [(0.02, 0.98), (5.0, 75.0), (-1.2, 1.2)]
+
+        def build(p):
+            base = p0 + min(max(p[0], 0.0), 1.0) * (p1 - p0) + n_in * inset
+            aim = _tilt_down(_rot2d(n_in, p[2]), p[1])
+            return LampInstance(photometry, pos=(base[0], base[1], h), aim=aim, meta=m)
+        return x0, bounds, build, (lambda p: True)
+    if kind == "corner":
+        base, bis, h = m["base"], m["bis"], m["h"]
+        x0 = [m.get("tilt", 30.0), m.get("az", 0.0)]
+        bounds = [(5.0, 75.0), (-1.2, 1.2)]
+
+        def build(p):
+            aim = _tilt_down(_rot2d(bis, p[1]), p[0])
+            return LampInstance(photometry, pos=(base[0], base[1], h), aim=aim, meta=m)
+        return x0, bounds, build, (lambda p: True)
+    if kind == "ceiling":
+        h = m["h"]
+        (xmn, ymn), (xmx, ymx) = room.bbox
+        x0 = [float(lamp.pos[0]), float(lamp.pos[1])]
+        bounds = [(xmn, xmx), (ymn, ymx)]
+
+        def build(p):
+            return LampInstance(photometry, pos=(p[0], p[1], h), aim=DOWN, meta=m)
+        return x0, bounds, build, (lambda p: bool(room.contains(np.array([[p[0], p[1]]]))[0]))
+    return None, None, None, None
+
+
+def _refine_layout(sel, photometry, room, cov_pts, plane, skin_mode, eye_mode,
+                   skin_cap, eye_cap, fluence_cap, w, margin_tax, tgt, n_az, cap_margin,
+                   passes):
+    """Coordinate-ascent polish of each lamp's continuous placement (Nelder-Mead).
+
+    Cheap by design: the avg grid is subsampled and exposure uses coarse azimuths -- the
+    penalty keeps exposure below cap_margin (not the true cap) so that discretisation
+    headroom guarantees the full-resolution final metrics stay under the real limit.
+    """
+    lamps = list(sel)
+    if len(cov_pts) > 1200:                         # subsample the smooth avg objective
+        cov_pts = cov_pts[np.linspace(0, len(cov_pts) - 1, 1200).astype(int)]
+
+    def score(ls):
+        f = fluence_field(ls, cov_pts)
+        cavg = float(np.minimum(f, fluence_cap).mean())
+        mn = float(f.min())
+        s = float(exposure_field(ls, plane, skin_mode, n_az).max()) if skin_cap > 0 else 0.0
+        e = float(exposure_field(ls, plane, eye_mode, n_az).max()) if eye_cap > 0 else 0.0
+        us = s / skin_cap if skin_cap > 0 else 0.0
+        ue = e / eye_cap if eye_cap > 0 else 0.0
+        obj = (1.0 - w) * cavg / tgt + w * mn / tgt - margin_tax * max(us, ue)
+        viol = max(0.0, us - cap_margin) + max(0.0, ue - cap_margin)  # keep the headroom
+        return obj - 1e3 * viol
+
+    for _ in range(passes):
+        for i in range(len(lamps)):
+            x0, bounds, build, valid = _lamp_params(lamps[i], photometry, room)
+            if x0 is None:
+                continue
+
+            def neg(p, _i=i, _build=build, _valid=valid):
+                if not _valid(p):
+                    return 1e6
+                lamps[_i] = _build(p)
+                return -score(lamps)
+
+            res = minimize(neg, x0, method="Nelder-Mead", bounds=bounds,
+                           options={"maxiter": 80, "xatol": 1e-2, "fatol": 1e-4})
+            lamps[i] = build(res.x)
+    return lamps
 
 
 # --- helpers --------------------------------------------------------------
