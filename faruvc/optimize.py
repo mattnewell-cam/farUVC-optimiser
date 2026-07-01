@@ -590,13 +590,14 @@ def _refine_layout(sel, photometry, room, cov_pts, plane, skin_mode, eye_mode,
 # --- large-room uniform tiling -------------------------------------------
 def _tile_solution(room, photometry, target, cov_pts, plane, skin_mode, eye_mode,
                    skin_lim, eye_lim, z_ceil):
-    """Coarsest uniform downlight grid (fewest lamps) whose occupied-zone average fluence
-    >= target and whose per-lamp exposure stays within the margin'd caps. Returns the lamp
-    list, or None if even the finest grid can't do it. A 1-D pitch search -- O(1) in room
-    size -- for rooms too large to select lamps combinatorially."""
+    """Uniform downlight grid sized to hit `target` occupied-zone average with the fewest
+    lamps. Average fluence ~ k/pitch^2, so we measure k from one reference grid and invert
+    to the pitch that just meets target -- landing on target instead of overshooting a
+    coarse sweep. O(1) in room size; returns the lamp list, or None if infeasible."""
     (xmn, ymn), (xmx, ymx) = room.bbox
     inset = 0.6
-    for pitch in np.arange(5.0, 0.75 - 1e-9, -0.25):
+
+    def grid(pitch):
         def _ax(lo, hi):
             n = max(1, int(np.floor((hi - lo) / pitch)) + 1)
             return (lo + hi) / 2.0 - (n - 1) * pitch / 2.0 + np.arange(n) * pitch
@@ -604,15 +605,24 @@ def _tile_solution(room, photometry, target, cov_pts, plane, skin_mode, eye_mode
                              indexing="ij")
         flat = np.column_stack([gx.ravel(), gy.ravel()])
         flat = flat[room.contains(flat)]
-        if len(flat) == 0:
-            continue
-        ls = [LampInstance(photometry, pos=(x, y, z_ceil)) for x, y in flat]
-        if float(fluence_field(ls, cov_pts).mean()) < target:
-            continue                       # too sparse to hit the target
-        ms = float(exposure_field(ls, plane, skin_mode, 16).max()) if skin_lim > 0 else 0.0
-        me = float(exposure_field(ls, plane, eye_mode, 16).max()) if eye_lim > 0 else 0.0
-        if ms <= skin_lim and me <= eye_lim:
-            return ls                      # coarsest feasible grid
+        return [LampInstance(photometry, pos=(x, y, z_ceil)) for x, y in flat]
+
+    ref = grid(3.0)
+    if not ref:
+        return None
+    a_ref = float(fluence_field(ref, cov_pts).mean())
+    if a_ref <= 0:
+        return None
+    pitch = float(np.sqrt(a_ref * 9.0 / target))     # k = avg*pitch^2 (ref pitch 3.0); invert
+    for _ in range(25):                              # verify + step finer for edge effects
+        ls = grid(pitch)
+        if ls and float(fluence_field(ls, cov_pts).mean()) >= target:
+            ms = float(exposure_field(ls, plane, skin_mode, 16).max()) if skin_lim > 0 else 0.0
+            me = float(exposure_field(ls, plane, eye_mode, 16).max()) if eye_lim > 0 else 0.0
+            return ls if (ms <= skin_lim and me <= eye_lim) else None  # cap-violation = mount too low
+        pitch -= 0.15
+        if pitch < 0.75:
+            return None
     return None
 
 
