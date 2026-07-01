@@ -1,7 +1,6 @@
 # Runtime dependencies for faruvcOptimiser
 numpy>=1.26
-scipy>=1.13
-pulp>=2.8           # ILP solver (bundled CBC) for minimum-lamp optimisation
+scipy>=1.13         # optimize.milp (HiGHS) = the ILP solver; also the vectorised field maths
 fastapi>=0.110
 uvicorn[standard]>=0.29
 

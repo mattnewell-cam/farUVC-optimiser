@@ -29,9 +29,10 @@ def generate_candidates(
     wall_inset: float = 0.3,
     edge_inset: float = 0.1,
     wall_mount_height: float | None = None,
-    wall_spacing: float = 1.0,
-    wall_tilt_deg: float = 30.0,
-    corner_tilt_deg: float = 30.0,
+    wall_spacing: float = 1.5,
+    tilts: tuple[float, ...] = (25.0, 40.0),
+    aim_azimuths: int = 3,
+    azimuth_spread_deg: float = 45.0,
 ) -> list[LampInstance]:
     """Return a list of candidate LampInstances.
 
@@ -45,8 +46,11 @@ def generate_candidates(
     # Downlights are inset from the walls (wall_inset): a ceiling fixture can't hang in
     # the wall, and a downlight against a wall wastes half its cone. Wall/corner MOUNTS,
     # by contrast, physically sit ON the wall/corner -> only a token edge_inset to keep
-    # them inside the polygon (and off the 1/r^2 singularity).
-    for xy in _interior_grid(room, grid_spacing, wall_inset):
+    # them inside the polygon (and off the 1/r^2 singularity). In corner_edge mode the
+    # swept edge/corner aims dominate, so we thin the downlight grid to keep the candidate
+    # count (and solve time) down.
+    dl_spacing = grid_spacing if mode == "downlight" else max(grid_spacing, 1.0)
+    for xy in _interior_grid(room, dl_spacing, wall_inset):
         candidates.append(LampInstance(photometry, pos=(xy[0], xy[1], z_ceil), aim=DOWN))
 
     if mode == "downlight":
@@ -54,7 +58,11 @@ def generate_candidates(
 
     # --- corner/edge lamps -------------------------------------------------
     h = wall_mount_height if wall_mount_height is not None else z_ceil
-    # Wall mounts: spaced along each edge, aimed along the inward normal, tilted down.
+    # Wall/corner mounts sweep AIM ANGLE rather than using one fixed aim: at each position
+    # we fan the horizontal direction across the inward half-space and try several tilts.
+    # (No "aim at the far corner" heuristic -- that's brittle for concave/complex shapes;
+    # sweeping is shape-agnostic. Adding aims is cheap: the field maths is vectorised, and
+    # avg fluence is separable so the solver handles the extra candidates well.)
     for p0, p1 in room.edges():
         n_in = _inward_normal(room, p0, p1)
         edge = p1 - p0
@@ -65,10 +73,10 @@ def generate_candidates(
         for k in range(npts):
             t = (k + 0.5) / npts
             base = p0 + t * edge + n_in * edge_inset
-            aim = _tilt_down(n_in, wall_tilt_deg)
-            candidates.append(LampInstance(photometry, pos=(base[0], base[1], h), aim=aim))
+            for aim in _aim_sweep(n_in, tilts, aim_azimuths, azimuth_spread_deg):
+                candidates.append(LampInstance(photometry, pos=(base[0], base[1], h), aim=aim))
 
-    # Corner mounts: aimed along the inward angle bisector, tilted down.
+    # Corner mounts: fan around the inward angle bisector.
     v = room.vertices
     n = len(v)
     for i in range(n):
@@ -80,10 +88,22 @@ def generate_candidates(
         if not room.contains((cur + bis * 0.1)[None, :])[0]:
             bis = -bis
         base = cur + bis * edge_inset
-        aim = _tilt_down(bis, corner_tilt_deg)
-        candidates.append(LampInstance(photometry, pos=(base[0], base[1], h), aim=aim))
+        for aim in _aim_sweep(bis, tilts, aim_azimuths, azimuth_spread_deg):
+            candidates.append(LampInstance(photometry, pos=(base[0], base[1], h), aim=aim))
 
     return candidates
+
+
+def _aim_sweep(inward2d, tilts, n_az, spread_deg):
+    """Aim directions: horizontal fan (±spread around the inward reference) × tilts."""
+    base = np.arctan2(inward2d[1], inward2d[0])
+    offs = [0.0] if n_az <= 1 else np.radians(np.linspace(-spread_deg, spread_deg, n_az))
+    aims = []
+    for off in offs:
+        horiz = np.array([np.cos(base + off), np.sin(base + off)])
+        for td in tilts:
+            aims.append(_tilt_down(horiz, td))
+    return aims
 
 
 # --- helpers --------------------------------------------------------------

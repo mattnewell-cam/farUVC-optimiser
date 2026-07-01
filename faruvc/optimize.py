@@ -72,7 +72,7 @@ def optimize(
     n_azimuths: int = 16,
     cap_margin: float = 0.95,
     max_coverage_points: int = 400,
-    time_limit: float = 20.0,
+    time_limit: float = 15.0,
     solver_msg: bool = False,
     **candidate_kwargs,
 ) -> OptimizeResult:
@@ -163,7 +163,9 @@ def optimize(
     if A_util.shape[0] > 0:
         peak_rows = np.unique(np.argsort(-A_util, axis=0)[:2].ravel())
         A_util = A_util[peak_rows]
-    opts = {"time_limit": time_limit, "disp": bool(solver_msg)}
+    # A 1% optimality gap is far below the modelling noise here and lets HiGHS stop as
+    # soon as it has a provably near-optimal layout instead of grinding to close the gap.
+    opts = {"time_limit": time_limit, "mip_rel_gap": 0.01, "disp": bool(solver_msg)}
 
     # --- Stage 1: minimise lamp count -------------------------------------
     cons1 = [LinearConstraint(fvec, target_fluence, np.inf)]
