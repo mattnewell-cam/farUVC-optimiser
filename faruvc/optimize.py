@@ -130,6 +130,44 @@ def optimize(
     opts2 = _solver_options(stage2_time_limit if stage2_time_limit is not None else time_limit,
                             solver_msg)
 
+    # --- Large-room fast path: uniform tiling -----------------------------
+    # If the target needs many lamps, combinatorial selection is intractable (dozens of
+    # lamps -> C(candidates, n) is astronomically large: neither enumerable nor provable,
+    # and the coarsen backstop can't shrink C(n, dozens) either). But a big ~homogeneous
+    # room's optimum IS a regular grid, so solve for the grid PITCH -- a 1-D search, O(1)
+    # in room size. Trigger off a cheap lamp estimate: one central downlight's occupied-
+    # zone contribution vs the target.
+    z_ceil = room.height - 0.05
+    cen = room.centroid()
+    a0 = float(fluence_field([LampInstance(photometry, pos=(cen[0], cen[1], z_ceil))],
+                             vol[cov]).mean())
+    if a0 > 0 and target_fluence / a0 > 12:
+        sel = _tile_solution(room, photometry, target_fluence, vol[cov], plane,
+                             skin_mode, eye_mode, skin_lim, eye_lim, z_ceil)
+        if sel is None:
+            return OptimizeResult(
+                "infeasible", 0, eye_cap=eye_cap, skin_cap=skin_cap,
+                target_fluence=target_fluence,
+                message="large room: no uniform lamp grid reaches the target within the "
+                        "exposure caps -- raise the mount, dim the lamps, or relax the standard",
+                total_seconds=time.perf_counter() - t_total)
+        f_eval = fluence_field(sel, vol)
+        s_eval = exposure_field(sel, plane, skin_mode, n_az=max(16, n_azimuths))
+        e_eval = exposure_field(sel, plane, eye_mode, n_az=max(16, n_azimuths))
+        max_util = max((float(s_eval.max()) / skin_cap) if skin_cap > 0 else 0.0,
+                       (float(e_eval.max()) / eye_cap) if eye_cap > 0 else 0.0)
+        return OptimizeResult(
+            status="optimal", n_lamps=len(sel), lamps=[_lamp_dict(l) for l in sel],
+            avg_fluence=float(np.minimum(f_eval[cov], fluence_cap).mean()),
+            min_fluence=float(f_eval[cov].min()),
+            max_skin=float(s_eval.max()), max_eye=float(e_eval.max()),
+            skin_cap=skin_cap, eye_cap=eye_cap, target_fluence=target_fluence,
+            max_util=float(max_util), goal=goal,
+            message=(f"{len(sel)} lamps | {standard.label} | uniform grid (large-room "
+                     f"tiling) | eye={eye_mode}, skin={skin_mode} @ {height:.2f} m"),
+            candidate_count=len(sel), stage2_status="uniform tiling (pitch search)",
+            total_seconds=time.perf_counter() - t_total)
+
     def _build(ws, n_az, tilts):
         """Generate candidates at spacing ws + aim fan (n_az, tilts), build coeffs, stage 1."""
         ck = dict(candidate_kwargs, wall_spacing=ws, grid_spacing=ws,
@@ -547,6 +585,35 @@ def _refine_layout(sel, photometry, room, cov_pts, plane, skin_mode, eye_mode,
                            options={"maxiter": 80, "xatol": 1e-2, "fatol": 1e-4})
             lamps[i] = build(res.x)
     return lamps
+
+
+# --- large-room uniform tiling -------------------------------------------
+def _tile_solution(room, photometry, target, cov_pts, plane, skin_mode, eye_mode,
+                   skin_lim, eye_lim, z_ceil):
+    """Coarsest uniform downlight grid (fewest lamps) whose occupied-zone average fluence
+    >= target and whose per-lamp exposure stays within the margin'd caps. Returns the lamp
+    list, or None if even the finest grid can't do it. A 1-D pitch search -- O(1) in room
+    size -- for rooms too large to select lamps combinatorially."""
+    (xmn, ymn), (xmx, ymx) = room.bbox
+    inset = 0.6
+    for pitch in np.arange(5.0, 0.75 - 1e-9, -0.25):
+        def _ax(lo, hi):
+            n = max(1, int(np.floor((hi - lo) / pitch)) + 1)
+            return (lo + hi) / 2.0 - (n - 1) * pitch / 2.0 + np.arange(n) * pitch
+        gx, gy = np.meshgrid(_ax(xmn + inset, xmx - inset), _ax(ymn + inset, ymx - inset),
+                             indexing="ij")
+        flat = np.column_stack([gx.ravel(), gy.ravel()])
+        flat = flat[room.contains(flat)]
+        if len(flat) == 0:
+            continue
+        ls = [LampInstance(photometry, pos=(x, y, z_ceil)) for x, y in flat]
+        if float(fluence_field(ls, cov_pts).mean()) < target:
+            continue                       # too sparse to hit the target
+        ms = float(exposure_field(ls, plane, skin_mode, 16).max()) if skin_lim > 0 else 0.0
+        me = float(exposure_field(ls, plane, eye_mode, 16).max()) if eye_lim > 0 else 0.0
+        if ms <= skin_lim and me <= eye_lim:
+            return ls                      # coarsest feasible grid
+    return None
 
 
 # --- helpers --------------------------------------------------------------
