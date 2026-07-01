@@ -85,7 +85,7 @@ def optimize(
     refine_passes: int = 2,
     time_limit: float | None = 12.0,
     stage2_time_limit: float | None = None,
-    exact_enum_limit: int = 1_500_000,
+    exact_enum_limit: int = 100_000,
     solver_msg: bool = False,
     **candidate_kwargs,
 ) -> OptimizeResult:
@@ -105,84 +105,104 @@ def optimize(
     eye_mode, skin_mode = zone.eye_mode, zone.skin_mode
     height = occupant_height if occupant_height is not None else zone.height_m
 
-    candidates = generate_candidates(room, photometry, mode=mode, **candidate_kwargs)
-    if not candidates:
-        return OptimizeResult("infeasible", 0, message="no candidate positions",
-                              eye_cap=eye_cap, skin_cap=skin_cap,
-                              target_fluence=target_fluence,
-                              total_seconds=time.perf_counter() - t_total)
+    # Area-adaptive candidate spacing: the search cost tracks candidate count, and the
+    # downlight count is ~area/spacing^2, so scaling spacing with sqrt(area) keeps the
+    # problem size (and solve time) roughly constant across room sizes. Big/open rooms
+    # tolerate coarser grids (refine recovers the between-grid optimum); small or sharp
+    # rooms keep a fine grid where it's cheap. Calibrated so ~25 m^2 -> ~1.0 m (empirically
+    # within 1% of the fine-grid optimum). Explicit wall_spacing/grid_spacing override it.
+    auto = float(np.clip(np.sqrt(max(room.area, 1e-6) / 25.0), 0.7, 3.0))
+    candidate_kwargs.setdefault("wall_spacing", auto)
+    candidate_kwargs.setdefault("grid_spacing", auto)
 
+    # Grids (spacing-independent) and evaluation zone.
     vol = room.volume_grid(spacing=fluence_spacing)
     plane = room.plane_grid(z=height, spacing=plane_spacing)
-
-    nC = len(candidates)
-    # Per-candidate contributions (linear coefficients):
-    F = np.empty((nC, len(vol)))              # fluence per volume point
-    # Eye/skin exposure "terms": (nC, n_plane, n_samples) per the standard's calc mode.
-    skin_t = [lamp_exposure_terms(candidates[c], plane, skin_mode, n_azimuths) for c in range(nC)]
-    eye_t = [lamp_exposure_terms(candidates[c], plane, eye_mode, n_azimuths) for c in range(nC)]
-    skin_t = np.stack(skin_t)                  # (nC, nP, Ks)
-    eye_t = np.stack(eye_t)                    # (nC, nP, Ke)
-    for c, lamp in enumerate(candidates):
-        F[c] = lamp.fluence(vol)
-    # Evaluation zone: the occupied band (floor up to coverage_top). BOTH the germicidal
-    # average AND the worst-spot minimum are measured here, not over the full volume.
-    # Points up near the ceiling sit centimetres from the lamps, where the 1/r^2 point-
-    # source model diverges (a grid point 2 cm from a lamp reads ~13000 uW/cm2). Averaging
-    # those in lets a layout inflate its "average" by parking a lamp next to a grid point
-    # instead of actually lighting the room -- which is exactly what the max-average goal
-    # was doing. Restricting to the occupied band drops the singular near-field (lamps
-    # mount above it) and matches the zone people/pathogens actually occupy.
+    # Occupied band (floor..coverage_top): the near-ceiling 1/r^2 singularity is excluded
+    # so a layout can't inflate its "average" by parking a lamp next to a grid point.
     cov_top = min(coverage_top, room.height - 0.1)
     cov = np.where(vol[:, 2] <= cov_top)[0]
     if len(cov) == 0:
         cov = np.arange(len(vol))
-
-    # Capped occupied-zone average per candidate. Each point's fluence is clipped at
-    # fluence_cap: a saturated spot gains nothing more (well-mixed air can't all funnel
-    # through one hotspot), and the clip also bounds any residual near-field 1/r^2 spike.
-    # We clip PER-LAMP -- min(cap, F[c,p]) -- so the average stays a separable linear
-    # function of the lamp selection and the ILP stays small/fast. That's exact for the
-    # dominant single-lamp case and over-counts only where two beams both exceed the cap
-    # at the same occupied-zone point (rare, since lamps mount above the zone). The
-    # REPORTED avg_fluence below uses the exact total cap, so the displayed number is honest.
-    fvec = np.minimum(F[:, cov], fluence_cap).mean(axis=1)
-    # Subsample coverage points used in the (heavier) max-min stage to keep it fast.
-    if len(cov) > max_coverage_points:
-        cov_stage2 = cov[np.linspace(0, len(cov) - 1, max_coverage_points).astype(int)]
-    else:
-        cov_stage2 = cov
-
-    # --- Exposure/utilisation constraint matrices (vectorised, built in one shot) ---
-    # Each exposure sample is a row  Σ_c A[s,c]·x_c ≤ lim.  skin_t/eye_t are (nC, nP, K);
-    # reshape to (samples, nC).  Rows that can't bind even with every candidate lit
-    # (row-sum ≤ lim) are dropped -- exact, and a big size cut.  This replaces the old
-    # term-by-term PuLP build (which was ~90% of the runtime; the field maths is ~0.1 s).
-    exp_mats, exp_ubs, util_mats = [], [], []
-    for terms, cap, lim in ((skin_t, skin_cap, skin_lim), (eye_t, eye_cap, eye_lim)):
-        M = terms.reshape(nC, -1).T                    # (samples, nC)
-        keep = M.sum(axis=1) > lim
-        if keep.any():
-            Mk = M[keep]
-            exp_mats.append(Mk)
-            exp_ubs.append(np.full(Mk.shape[0], lim))
-            if cap > 0:
-                util_mats.append(Mk / cap)             # utilisation = exposure / true cap
-    A_exp = np.vstack(exp_mats) if exp_mats else np.zeros((0, nC))
-    ub_exp = np.concatenate(exp_ubs) if exp_ubs else np.zeros(0)
-    A_util = np.vstack(util_mats) if util_mats else np.zeros((0, nC))
+    cov_stage2 = (cov[np.linspace(0, len(cov) - 1, max_coverage_points).astype(int)]
+                  if len(cov) > max_coverage_points else cov)
     opts = _solver_options(time_limit, solver_msg)
     opts2 = _solver_options(stage2_time_limit if stage2_time_limit is not None else time_limit,
                             solver_msg)
 
-    # --- Stage 1: minimise lamp count -------------------------------------
-    cons1 = [LinearConstraint(fvec, target_fluence, np.inf)]
-    if A_exp.shape[0]:
-        cons1.append(LinearConstraint(sparse.csr_matrix(A_exp), -np.inf, ub_exp))
-    t_stage1 = time.perf_counter()
-    res1 = milp(c=np.ones(nC), constraints=cons1, integrality=np.ones(nC),
-                bounds=Bounds(0, 1), options=opts)
-    stage1_seconds = time.perf_counter() - t_stage1
+    def _build(ws, n_az, tilts):
+        """Generate candidates at spacing ws + aim fan (n_az, tilts), build coeffs, stage 1."""
+        ck = dict(candidate_kwargs, wall_spacing=ws, grid_spacing=ws,
+                  aim_azimuths=n_az, tilts=tilts)
+        cands = generate_candidates(room, photometry, mode=mode, **ck)
+        if not cands:
+            return None
+        nC = len(cands)
+        F = np.empty((nC, len(vol)))
+        skin_t = np.stack([lamp_exposure_terms(cands[c], plane, skin_mode, n_azimuths) for c in range(nC)])
+        eye_t = np.stack([lamp_exposure_terms(cands[c], plane, eye_mode, n_azimuths) for c in range(nC)])
+        for c, lamp in enumerate(cands):
+            F[c] = lamp.fluence(vol)
+        # capped per-lamp occupied-zone mean (separable linear avg coefficient)
+        fvec = np.minimum(F[:, cov], fluence_cap).mean(axis=1)
+        exp_mats, exp_ubs, util_mats = [], [], []
+        for terms, cap, lim in ((skin_t, skin_cap, skin_lim), (eye_t, eye_cap, eye_lim)):
+            M = terms.reshape(nC, -1).T
+            keep = M.sum(axis=1) > lim
+            if keep.any():
+                Mk = M[keep]
+                exp_mats.append(Mk); exp_ubs.append(np.full(Mk.shape[0], lim))
+                if cap > 0:
+                    util_mats.append(Mk / cap)
+        A_exp = np.vstack(exp_mats) if exp_mats else np.zeros((0, nC))
+        ub_exp = np.concatenate(exp_ubs) if exp_ubs else np.zeros(0)
+        A_util = np.vstack(util_mats) if util_mats else np.zeros((0, nC))
+        cons1 = [LinearConstraint(fvec, target_fluence, np.inf)]
+        if A_exp.shape[0]:
+            cons1.append(LinearConstraint(sparse.csr_matrix(A_exp), -np.inf, ub_exp))
+        t1 = time.perf_counter()
+        res1 = milp(c=np.ones(nC), constraints=cons1, integrality=np.ones(nC),
+                    bounds=Bounds(0, 1), options=opts)
+        return dict(cands=cands, nC=nC, F=F, fvec=fvec, A_exp=A_exp, ub_exp=ub_exp,
+                    A_util=A_util, res1=res1, s1=time.perf_counter() - t1, ws=ws)
+
+    # Coarsen-until-exhaustive: after stage 1 gives the lamp count, if the stage-2
+    # arrangement count C(masked candidates, n_star) exceeds exact_enum_limit we can't
+    # solve it exhaustively -- and the MILP alternative can take MINUTES to prove for
+    # multi-lamp rooms. So coarsen the grid a notch and rebuild until the count fits: the
+    # big/open rooms that need this tolerate coarser grids (refine recovers the sub-grid
+    # optimum), and the result is always an exhaustive (certain) stage-2 solve.
+    ws = candidate_kwargs["wall_spacing"]
+    n_az = candidate_kwargs.get("aim_azimuths", 3)
+    tilts = candidate_kwargs.get("tilts", (25.0, 40.0))
+    S = _build(ws, n_az, tilts)
+    if S is None:
+        return OptimizeResult("infeasible", 0, message="no candidate positions",
+                              eye_cap=eye_cap, skin_cap=skin_cap,
+                              target_fluence=target_fluence,
+                              total_seconds=time.perf_counter() - t_total)
+    stage1_seconds = S["s1"]
+    for _ in range(7):
+        if S["res1"].x is None:
+            break
+        n_star = int(round(S["res1"].x.sum()))
+        nS = int(_stage2_candidate_mask(S["fvec"], n_star, target_fluence).sum())
+        combo = math.comb(nS, n_star) if 0 <= n_star <= nS else 0
+        if combo <= exact_enum_limit:
+            break
+        if ws < 4.0 - 1e-9:                 # first coarsen spacing...
+            ws = min(ws * 1.4, 4.0)
+        elif n_az > 1:                      # ...then drop the aim fan (refine recovers angles),
+            n_az, tilts = 1, (30.0,)        # which also cuts the irreducible corner candidates
+        else:
+            break                           # can't shrink further; stage 2 will MILP-solve it
+        S = _build(ws, n_az, tilts)
+        if S is None:
+            break
+        stage1_seconds += S["s1"]
+
+    candidates, nC, F, fvec = S["cands"], S["nC"], S["F"], S["fvec"]
+    A_exp, ub_exp, A_util, res1 = S["A_exp"], S["ub_exp"], S["A_util"], S["res1"]
     if res1.x is None:
         status = _milp_status(res1)
         return OptimizeResult(
@@ -191,8 +211,7 @@ def optimize(
             message=_infeasibility_hint(candidates, fvec, target_fluence,
                                         skin_cap, eye_cap, height, skin_mode, eye_mode)
                     if status == "infeasible" else str(res1.message),
-            candidate_count=nC,
-            stage1_seconds=stage1_seconds,
+            candidate_count=nC, stage1_seconds=stage1_seconds,
             total_seconds=time.perf_counter() - t_total,
         )
     n_star = int(round(res1.x.sum()))
